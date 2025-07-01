@@ -10,6 +10,10 @@ import sys
 from pytube import YouTube
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import google.auth
+import pickle
 import argparse
 import re
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -27,50 +31,85 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class YouTubeTranscriptionScrapper:
-    def __init__(self, youtube_api_key: str):
+    def __init__(self, youtube_api_key: Optional[str] = None, use_oauth: bool = False):
         """Initialize the scrapper with OpenAI and YouTube API clients"""
         # Load environment variables
         load_dotenv()
         
-        # Validate API keys
-        self._validate_api_keys(youtube_api_key)
-        
         # Initialize OpenAI client
-        try:
-            self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-            logger.info("OpenAI client initialized successfully")
-        except Exception as e:
-            logger.error("Failed to initialize OpenAI client: " + str(e))
-            raise
-            
+        self._init_openai_client()
+        
         # Initialize YouTube API client
-        try:
-            self.youtube = build('youtube', 'v3', developerKey=youtube_api_key)
-            logger.info("YouTube API client initialized successfully")
-        except Exception as e:
-            logger.error("Failed to initialize YouTube API client: " + str(e))
-            raise
+        if use_oauth:
+            self._init_youtube_oauth_client()
+        else:
+            self._init_youtube_api_client(youtube_api_key)
             
         # Rate limiting tracking
         self.last_api_call = 0
         self.api_call_count = 0
         self.rate_limit_window_start = time.time()
     
-    def _validate_api_keys(self, youtube_api_key: str) -> None:
-        """Validate required API keys are present and properly formatted"""
-        openai_key = os.getenv('OPENAI_API_KEY')
+    def _init_openai_client(self):
+        """Initialize OpenAI client"""
+        try:
+            openai_key = os.getenv('OPENAI_API_KEY')
+            if not openai_key:
+                raise ValueError("OPENAI_API_KEY environment variable is required")
+            
+            self.client = OpenAI(api_key=openai_key)
+            logger.info("OpenAI client initialized successfully")
+        except Exception as e:
+            logger.error("Failed to initialize OpenAI client: " + str(e))
+            raise
+    
+    def _init_youtube_api_client(self, youtube_api_key: str):
+        """Initialize YouTube API client with API key"""
+        try:
+            if not youtube_api_key:
+                raise ValueError("YouTube API key is required")
+            
+            self.youtube = build('youtube', 'v3', developerKey=youtube_api_key)
+            logger.info("YouTube API client initialized successfully")
+        except Exception as e:
+            logger.error("Failed to initialize YouTube API client: " + str(e))
+            raise
+    
+    def _init_youtube_oauth_client(self):
+        """Initialize YouTube API client with OAuth authentication"""
+        SCOPES = ['https://www.googleapis.com/auth/youtube.readonly']
+        creds = None
         
-        if not openai_key:
-            raise ValueError("OPENAI_API_KEY environment variable is required")
+        # Check if token.pickle exists
+        if os.path.exists('token.pickle'):
+            with open('token.pickle', 'rb') as token:
+                creds = pickle.load(token)
         
-        if not youtube_api_key:
-            raise ValueError("YouTube API key is required")
+        # If there are no (valid) credentials available, let the user log in
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                if not os.path.exists('client_secrets.json'):
+                    raise FileNotFoundError(
+                        "client_secrets.json not found. Please download it from Google Cloud Console."
+                    )
+                
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    'client_secrets.json', SCOPES)
+                creds = flow.run_local_server(port=0)
+            
+            # Save the credentials for the next run
+            with open('token.pickle', 'wb') as token:
+                pickle.dump(creds, token)
         
-        if not openai_key.startswith('sk-'):
-            logger.warning("OpenAI API key format may be incorrect")
-        
-        if len(youtube_api_key) < 30:
-            logger.warning("YouTube API key seems too short")
+        try:
+            self.youtube = build('youtube', 'v3', credentials=creds)
+            logger.info("YouTube OAuth client initialized successfully")
+        except Exception as e:
+            logger.error("Failed to initialize YouTube OAuth client: " + str(e))
+            raise
+    
     
     def _rate_limit_check(self) -> None:
         """Check and enforce rate limits"""
@@ -538,7 +577,9 @@ def main():
     """Main function to process videos from AI_TO_TRANSCRIBE playlist"""
     # Set up argument parser
     parser = argparse.ArgumentParser(description='YouTube Video Transcription and Analysis with Playlist Management')
-    parser.add_argument('youtube_api_key', help='YouTube Data API v3 key')
+    parser.add_argument('--youtube-api-key', help='YouTube Data API v3 key (for public videos only)')
+    parser.add_argument('--oauth', action='store_true', 
+                        help='Use OAuth authentication (required for private playlists)')
     parser.add_argument('--source-playlist', default=CONFIG.playlist.default_source_playlist, 
                         help=f'Source playlist name (default: {CONFIG.playlist.default_source_playlist})')
     parser.add_argument('--dest-playlist', default=CONFIG.playlist.default_dest_playlist, 
@@ -550,13 +591,22 @@ def main():
     
     args = parser.parse_args()
     
+    # Validate authentication arguments
+    if not args.oauth and not args.youtube_api_key:
+        parser.error("Either --oauth or --youtube-api-key must be specified")
+    
     # Update config with command line arguments
     CONFIG.file.output_directory = args.output_dir
     
     try:
         # Initialize scrapper
         logger.info("Initializing YouTube Transcription Scrapper...")
-        scrapper = YouTubeTranscriptionScrapper(args.youtube_api_key)
+        if args.oauth:
+            logger.info("Using OAuth authentication for YouTube API")
+            scrapper = YouTubeTranscriptionScrapper(use_oauth=True)
+        else:
+            logger.info("Using API key for YouTube API")
+            scrapper = YouTubeTranscriptionScrapper(youtube_api_key=args.youtube_api_key)
         
         # Get playlist IDs
         logger.info(f"Looking up playlist IDs...")
