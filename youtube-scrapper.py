@@ -172,7 +172,7 @@ class YouTubeTranscriptionScrapper:
 
             # Fetch and join transcript text
             transcript_data = transcript.fetch()
-            full_transcript = " ".join([entry['text'] for entry in transcript_data])
+            full_transcript = " ".join([entry.text for entry in transcript_data])
             
             # Check transcript length and truncate if necessary
             if len(full_transcript) > CONFIG.transcript.max_transcript_length:
