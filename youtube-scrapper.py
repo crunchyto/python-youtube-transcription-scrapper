@@ -1,5 +1,7 @@
 import os
 import logging
+import asyncio
+import time
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi
 from openai import OpenAI
@@ -10,10 +12,18 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import argparse
 import re
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tqdm import tqdm
+import aiohttp
+from config import CONFIG
 
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=getattr(logging, CONFIG.logging.level),
+    format=CONFIG.logging.format,
+    filename=CONFIG.logging.file_output
+)
 logger = logging.getLogger(__name__)
 
 class YouTubeTranscriptionScrapper:
@@ -21,6 +31,9 @@ class YouTubeTranscriptionScrapper:
         """Initialize the scrapper with OpenAI and YouTube API clients"""
         # Load environment variables
         load_dotenv()
+        
+        # Validate API keys
+        self._validate_api_keys(youtube_api_key)
         
         # Initialize OpenAI client
         try:
@@ -37,11 +50,58 @@ class YouTubeTranscriptionScrapper:
         except Exception as e:
             logger.error("Failed to initialize YouTube API client: " + str(e))
             raise
+            
+        # Rate limiting tracking
+        self.last_api_call = 0
+        self.api_call_count = 0
+        self.rate_limit_window_start = time.time()
+    
+    def _validate_api_keys(self, youtube_api_key: str) -> None:
+        """Validate required API keys are present and properly formatted"""
+        openai_key = os.getenv('OPENAI_API_KEY')
+        
+        if not openai_key:
+            raise ValueError("OPENAI_API_KEY environment variable is required")
+        
+        if not youtube_api_key:
+            raise ValueError("YouTube API key is required")
+        
+        if not openai_key.startswith('sk-'):
+            logger.warning("OpenAI API key format may be incorrect")
+        
+        if len(youtube_api_key) < 30:
+            logger.warning("YouTube API key seems too short")
+    
+    def _rate_limit_check(self) -> None:
+        """Check and enforce rate limits"""
+        current_time = time.time()
+        
+        # Reset counter every minute
+        if current_time - self.rate_limit_window_start >= 60:
+            self.api_call_count = 0
+            self.rate_limit_window_start = current_time
+        
+        # Check if we're hitting rate limits
+        if self.api_call_count >= CONFIG.api.rate_limit_requests_per_minute:
+            sleep_time = 60 - (current_time - self.rate_limit_window_start)
+            if sleep_time > 0:
+                logger.info(f"Rate limit reached, sleeping for {sleep_time:.1f} seconds")
+                time.sleep(sleep_time)
+                self.api_call_count = 0
+                self.rate_limit_window_start = time.time()
+        
+        self.api_call_count += 1
+        self.last_api_call = current_time
 
-    def get_video_transcript(self, video_id):
+    @retry(
+        stop=stop_after_attempt(CONFIG.api.max_retries),
+        wait=wait_exponential(multiplier=CONFIG.api.retry_delay, min=1, max=10),
+        retry=retry_if_exception_type((Exception,))
+    )
+    def get_video_transcript(self, video_id: str) -> Optional[str]:
         """
-        Fetch transcript for a YouTube video.
-        Tries to fetch 'en' transcript first, then 'es' if 'en' is not available.
+        Fetch transcript for a YouTube video with retry logic.
+        Tries preferred languages in order.
 
         Args:
             video_id: YouTube video ID
@@ -50,33 +110,47 @@ class YouTubeTranscriptionScrapper:
             Transcript text if successful, None if failed
         """
         try:
-            logger.info("Fetching transcript for video ID: " + video_id)
+            logger.info(f"Fetching transcript for video ID: {video_id}")
+            self._rate_limit_check()
+            
             # Get list of available transcripts
             transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
             transcript = None
 
-            # Try to fetch English transcript
-            try:
-                transcript = transcript_list.find_transcript(['en'])
-                logger.info("English transcript found")
-            except Exception:
-                logger.info("English transcript not found, trying Spanish")
+            # Try preferred languages in order
+            for lang in CONFIG.transcript.preferred_languages:
                 try:
-                    transcript = transcript_list.find_transcript(['es'])
-                    logger.info("Spanish transcript found")
+                    transcript = transcript_list.find_transcript([lang])
+                    logger.info(f"{lang.upper()} transcript found")
+                    break
                 except Exception:
-                    logger.error("Neither English nor Spanish transcript found")
-                    return None
+                    logger.debug(f"{lang.upper()} transcript not found")
+                    continue
+            
+            if not transcript:
+                logger.error(f"No transcript found in preferred languages: {CONFIG.transcript.preferred_languages}")
+                return None
 
             # Fetch and join transcript text
             transcript_data = transcript.fetch()
-            full_transcript = " ".join([entry.text for entry in transcript_data])
+            full_transcript = " ".join([entry['text'] for entry in transcript_data])
+            
+            # Check transcript length and truncate if necessary
+            if len(full_transcript) > CONFIG.transcript.max_transcript_length:
+                logger.warning(f"Transcript too long ({len(full_transcript)} chars), truncating to {CONFIG.transcript.max_transcript_length}")
+                full_transcript = full_transcript[:CONFIG.transcript.max_transcript_length]
+            
             logger.info("Transcript fetched successfully")
             return full_transcript
         except Exception as e:
-            logger.error("Error fetching transcript: " + str(e))
-            return None
+            logger.error(f"Error fetching transcript: {str(e)}")
+            raise
 
+    @retry(
+        stop=stop_after_attempt(CONFIG.api.max_retries),
+        wait=wait_exponential(multiplier=CONFIG.api.retry_delay, min=1, max=10),
+        retry=retry_if_exception_type((HttpError,))
+    )
     def get_playlist_id_by_name(self, playlist_name: str) -> Optional[str]:
         """
         Get playlist ID by playlist name from the authenticated user's playlists
@@ -89,10 +163,12 @@ class YouTubeTranscriptionScrapper:
         """
         try:
             logger.info(f"Searching for playlist: {playlist_name}")
+            self._rate_limit_check()
+            
             request = self.youtube.playlists().list(
                 part="snippet",
                 mine=True,
-                maxResults=50
+                maxResults=CONFIG.api.youtube_api_max_results
             )
             response = request.execute()
             
@@ -107,8 +183,13 @@ class YouTubeTranscriptionScrapper:
             
         except HttpError as e:
             logger.error(f"Error searching for playlist '{playlist_name}': {e}")
-            return None
+            raise
 
+    @retry(
+        stop=stop_after_attempt(CONFIG.api.max_retries),
+        wait=wait_exponential(multiplier=CONFIG.api.retry_delay, min=1, max=10),
+        retry=retry_if_exception_type((HttpError,))
+    )
     def get_playlist_videos(self, playlist_id: str) -> List[Dict]:
         """
         Get all videos from a playlist
@@ -121,11 +202,13 @@ class YouTubeTranscriptionScrapper:
         """
         try:
             logger.info(f"Fetching videos from playlist: {playlist_id}")
+            self._rate_limit_check()
+            
             videos = []
             request = self.youtube.playlistItems().list(
                 part="snippet",
                 playlistId=playlist_id,
-                maxResults=50
+                maxResults=CONFIG.api.youtube_api_max_results
             )
             
             while request:
@@ -139,14 +222,21 @@ class YouTubeTranscriptionScrapper:
                     videos.append(video)
                 
                 request = self.youtube.playlistItems().list_next(request, response)
+                if request:
+                    self._rate_limit_check()
             
             logger.info(f"Found {len(videos)} videos in playlist")
             return videos
             
         except HttpError as e:
             logger.error(f"Error fetching playlist videos: {e}")
-            return []
+            raise
 
+    @retry(
+        stop=stop_after_attempt(CONFIG.api.max_retries),
+        wait=wait_exponential(multiplier=CONFIG.api.retry_delay, min=1, max=10),
+        retry=retry_if_exception_type((HttpError,))
+    )
     def add_video_to_playlist(self, video_id: str, playlist_id: str) -> bool:
         """
         Add a video to a playlist
@@ -160,6 +250,8 @@ class YouTubeTranscriptionScrapper:
         """
         try:
             logger.info(f"Adding video {video_id} to playlist {playlist_id}")
+            self._rate_limit_check()
+            
             request = self.youtube.playlistItems().insert(
                 part="snippet",
                 body={
@@ -178,8 +270,13 @@ class YouTubeTranscriptionScrapper:
             
         except HttpError as e:
             logger.error(f"Error adding video to playlist: {e}")
-            return False
+            raise
 
+    @retry(
+        stop=stop_after_attempt(CONFIG.api.max_retries),
+        wait=wait_exponential(multiplier=CONFIG.api.retry_delay, min=1, max=10),
+        retry=retry_if_exception_type((HttpError,))
+    )
     def remove_video_from_playlist(self, playlist_item_id: str) -> bool:
         """
         Remove a video from a playlist using its playlist item ID
@@ -192,6 +289,8 @@ class YouTubeTranscriptionScrapper:
         """
         try:
             logger.info(f"Removing playlist item {playlist_item_id}")
+            self._rate_limit_check()
+            
             request = self.youtube.playlistItems().delete(id=playlist_item_id)
             request.execute()
             logger.info(f"Successfully removed playlist item {playlist_item_id}")
@@ -199,7 +298,7 @@ class YouTubeTranscriptionScrapper:
             
         except HttpError as e:
             logger.error(f"Error removing video from playlist: {e}")
-            return False
+            raise
 
     def sanitize_filename(self, filename: str) -> str:
         """
@@ -215,11 +314,53 @@ class YouTubeTranscriptionScrapper:
         sanitized = re.sub(r'[<>:"/\\|?*]', '', filename)
         # Replace spaces with underscores
         sanitized = sanitized.replace(' ', '_')
+        # Remove extra underscores
+        sanitized = re.sub(r'_+', '_', sanitized)
+        # Strip leading/trailing underscores
+        sanitized = sanitized.strip('_')
         # Limit length to avoid filesystem issues
-        if len(sanitized) > 100:
-            sanitized = sanitized[:100]
-        return sanitized
+        if len(sanitized) > CONFIG.file.max_filename_length:
+            sanitized = sanitized[:CONFIG.file.max_filename_length]
+        return sanitized or "unnamed_video"
 
+    def _chunk_transcript(self, transcript: str) -> List[str]:
+        """
+        Split large transcripts into manageable chunks
+        
+        Args:
+            transcript: Full transcript text
+            
+        Returns:
+            List of transcript chunks
+        """
+        if len(transcript) <= CONFIG.transcript.chunk_size:
+            return [transcript]
+        
+        chunks = []
+        words = transcript.split()
+        current_chunk = []
+        current_length = 0
+        
+        for word in words:
+            word_length = len(word) + 1  # +1 for space
+            if current_length + word_length > CONFIG.transcript.chunk_size and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [word]
+                current_length = word_length
+            else:
+                current_chunk.append(word)
+                current_length += word_length
+        
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+        
+        return chunks
+    
+    @retry(
+        stop=stop_after_attempt(CONFIG.api.max_retries),
+        wait=wait_exponential(multiplier=CONFIG.api.retry_delay, min=1, max=10),
+        retry=retry_if_exception_type((Exception,))
+    )
     def analyze_transcript(self, transcript: str) -> Optional[Dict[str, str]]:
         """
         Analyze transcript using OpenAI to create summary and extract resources
@@ -232,8 +373,26 @@ class YouTubeTranscriptionScrapper:
         """
         try:
             logger.info("Analyzing transcript with OpenAI")
+            self._rate_limit_check()
             
-            prompt = """Please analyze this YouTube video transcript and provide:
+            # Handle large transcripts by chunking
+            chunks = self._chunk_transcript(transcript)
+            
+            if len(chunks) == 1:
+                # Single chunk - process normally
+                return self._analyze_single_transcript(transcript)
+            else:
+                # Multiple chunks - process each and combine
+                logger.info(f"Processing transcript in {len(chunks)} chunks")
+                return self._analyze_chunked_transcript(chunks)
+                
+        except Exception as e:
+            logger.error(f"Error analyzing transcript: {str(e)}")
+            raise
+    
+    def _analyze_single_transcript(self, transcript: str) -> Dict[str, str]:
+        """Analyze a single transcript chunk"""
+        prompt = """Please analyze this YouTube video transcript and provide:
 
 1. A comprehensive summary of the main points (3-4 paragraphs) with key points as bullets
 2. Extract any references to books, articles, YouTube channels, podcasts, websites, tools, or other media mentioned in the video
@@ -249,31 +408,63 @@ RESOURCES:
 
 If no resources are mentioned, write "No specific resources mentioned."""
 
-            response = self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that analyzes video transcripts."},
-                    {"role": "user", "content": f"{prompt}\n\nTranscript:\n{transcript}"}
-                ],
-                temperature=0.7
-            )
+        response = self.client.chat.completions.create(
+            model=CONFIG.api.openai_model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that analyzes video transcripts."},
+                {"role": "user", "content": f"{prompt}\n\nTranscript:\n{transcript}"}
+            ],
+            temperature=CONFIG.api.openai_temperature,
+            max_tokens=CONFIG.api.openai_max_tokens
+        )
+        
+        analysis = response.choices[0].message.content
+        logger.info("Analysis completed successfully")
+        
+        # Parse the response to separate summary and resources
+        if "SUMMARY:" in analysis and "RESOURCES:" in analysis:
+            parts = analysis.split("RESOURCES:")
+            summary = parts[0].replace("SUMMARY:", "").strip()
+            resources = parts[1].strip()
+            return {"summary": summary, "resources": resources}
+        else:
+            # Fallback if format is not followed
+            return {"summary": analysis, "resources": "No specific resources mentioned."}
+    
+    def _analyze_chunked_transcript(self, chunks: List[str]) -> Dict[str, str]:
+        """Analyze multiple transcript chunks and combine results"""
+        summaries = []
+        all_resources = set()
+        
+        for i, chunk in enumerate(chunks):
+            logger.info(f"Analyzing chunk {i+1}/{len(chunks)}")
+            chunk_analysis = self._analyze_single_transcript(chunk)
+            summaries.append(chunk_analysis['summary'])
             
-            analysis = response.choices[0].message.content
-            logger.info("Analysis completed successfully")
-            
-            # Parse the response to separate summary and resources
-            if "SUMMARY:" in analysis and "RESOURCES:" in analysis:
-                parts = analysis.split("RESOURCES:")
-                summary = parts[0].replace("SUMMARY:", "").strip()
-                resources = parts[1].strip()
-                return {"summary": summary, "resources": resources}
-            else:
-                # Fallback if format is not followed
-                return {"summary": analysis, "resources": "No specific resources mentioned."}
-                
-        except Exception as e:
-            logger.error("Error analyzing transcript: " + str(e))
-            return None
+            # Extract resources from this chunk
+            resources_text = chunk_analysis.get('resources', '')
+            if resources_text and resources_text != "No specific resources mentioned.":
+                # Parse resources and add to set
+                resource_lines = [line.strip() for line in resources_text.split('\n') if line.strip()]
+                for line in resource_lines:
+                    if line and not line.startswith(('1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.')):
+                        all_resources.add(line)
+                    elif line and any(line.startswith(f'{i}.') for i in range(1, 10)):
+                        all_resources.add(line[2:].strip())  # Remove numbering
+        
+        # Combine summaries
+        combined_summary = "\n\n--- PART SUMMARY ---\n\n".join(summaries)
+        
+        # Format resources
+        if all_resources:
+            resources_formatted = "\n".join(f"{i+1}. {resource}" for i, resource in enumerate(sorted(all_resources)))
+        else:
+            resources_formatted = "No specific resources mentioned."
+        
+        return {
+            "summary": combined_summary,
+            "resources": resources_formatted
+        }
 
     def process_video(self, video_id: str, video_title: str) -> bool:
         """
@@ -301,16 +492,21 @@ If no resources are mentioned, write "No specific resources mentioned."""
                 logger.error(f"Failed to analyze transcript for video {video_id}")
                 return False
             
-            # Create filename
+            # Create filename and output path
             safe_title = self.sanitize_filename(video_title)
             output_filename = f"{safe_title}.txt"
+            output_path = os.path.join(CONFIG.file.output_directory, output_filename)
+            
+            # Ensure output directory exists
+            os.makedirs(CONFIG.file.output_directory, exist_ok=True)
             
             # Write to file
             try:
-                with open(output_filename, "w", encoding="utf-8") as f:
+                with open(output_path, "w", encoding=CONFIG.file.file_encoding) as f:
                     f.write(f"Video Title: {video_title}\n")
                     f.write(f"Video ID: {video_id}\n")
-                    f.write(f"Video URL: https://www.youtube.com/watch?v={video_id}\n\n")
+                    f.write(f"Video URL: https://www.youtube.com/watch?v={video_id}\n")
+                    f.write(f"Processing Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                     
                     f.write("="*50 + "\n")
                     f.write("SUMMARY\n")
@@ -327,11 +523,11 @@ If no resources are mentioned, write "No specific resources mentioned."""
                     f.write("="*50 + "\n\n")
                     f.write(transcript + "\n")
                 
-                logger.info(f"Successfully saved analysis to {output_filename}")
+                logger.info(f"Successfully saved analysis to {output_path}")
                 return True
                 
             except Exception as e:
-                logger.error(f"Failed to write file {output_filename}: {e}")
+                logger.error(f"Failed to write file {output_path}: {e}")
                 return False
                 
         except Exception as e:
@@ -343,18 +539,27 @@ def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description='YouTube Video Transcription and Analysis with Playlist Management')
     parser.add_argument('youtube_api_key', help='YouTube Data API v3 key')
-    parser.add_argument('--source-playlist', default='AI_TO_TRANSCRIBE', 
-                        help='Source playlist name (default: AI_TO_TRANSCRIBE)')
-    parser.add_argument('--dest-playlist', default='AI_TRANSCRIBED', 
-                        help='Destination playlist name (default: AI_TRANSCRIBED)')
+    parser.add_argument('--source-playlist', default=CONFIG.playlist.default_source_playlist, 
+                        help=f'Source playlist name (default: {CONFIG.playlist.default_source_playlist})')
+    parser.add_argument('--dest-playlist', default=CONFIG.playlist.default_dest_playlist, 
+                        help=f'Destination playlist name (default: {CONFIG.playlist.default_dest_playlist})')
+    parser.add_argument('--output-dir', default=CONFIG.file.output_directory,
+                        help=f'Output directory for transcript files (default: {CONFIG.file.output_directory})')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Process videos but do not move them between playlists')
     
     args = parser.parse_args()
     
+    # Update config with command line arguments
+    CONFIG.file.output_directory = args.output_dir
+    
     try:
         # Initialize scrapper
+        logger.info("Initializing YouTube Transcription Scrapper...")
         scrapper = YouTubeTranscriptionScrapper(args.youtube_api_key)
         
         # Get playlist IDs
+        logger.info(f"Looking up playlist IDs...")
         source_playlist_id = scrapper.get_playlist_id_by_name(args.source_playlist)
         if not source_playlist_id:
             logger.error(f"Source playlist '{args.source_playlist}' not found")
@@ -366,6 +571,7 @@ def main():
             return
         
         # Get videos from source playlist
+        logger.info(f"Fetching videos from '{args.source_playlist}' playlist...")
         videos = scrapper.get_playlist_videos(source_playlist_id)
         if not videos:
             logger.info(f"No videos found in playlist '{args.source_playlist}'")
@@ -373,42 +579,69 @@ def main():
         
         logger.info(f"Found {len(videos)} videos to process")
         
-        # Process each video
+        if args.dry_run:
+            logger.info("DRY RUN MODE: Videos will be processed but not moved between playlists")
+        
+        # Process each video with progress bar
         processed_count = 0
         failed_count = 0
         
-        for video in videos:
-            video_id = video['id']
-            video_title = video['title']
-            playlist_item_id = video['playlistItemId']
-            
-            logger.info(f"Processing video {processed_count + failed_count + 1}/{len(videos)}: {video_title}")
-            
-            # Process the video
-            if scrapper.process_video(video_id, video_title):
-                # Successfully processed, move to destination playlist
-                if scrapper.add_video_to_playlist(video_id, dest_playlist_id):
-                    if scrapper.remove_video_from_playlist(playlist_item_id):
-                        logger.info(f"Successfully moved video '{video_title}' to {args.dest_playlist}")
+        with tqdm(total=len(videos), desc="Processing videos", unit="video") as pbar:
+            for video in videos:
+                video_id = video['id']
+                video_title = video['title']
+                playlist_item_id = video['playlistItemId']
+                
+                pbar.set_description(f"Processing: {video_title[:50]}{'...' if len(video_title) > 50 else ''}")
+                logger.info(f"Processing video {processed_count + failed_count + 1}/{len(videos)}: {video_title}")
+                
+                try:
+                    # Process the video
+                    if scrapper.process_video(video_id, video_title):
+                        if not args.dry_run:
+                            # Successfully processed, move to destination playlist
+                            try:
+                                scrapper.add_video_to_playlist(video_id, dest_playlist_id)
+                                scrapper.remove_video_from_playlist(playlist_item_id)
+                                logger.info(f"Successfully moved video '{video_title}' to {args.dest_playlist}")
+                            except Exception as e:
+                                logger.error(f"Failed to move video '{video_title}': {e}")
+                                failed_count += 1
+                                pbar.update(1)
+                                continue
+                        
                         processed_count += 1
+                        pbar.set_postfix({"✓": processed_count, "✗": failed_count})
                     else:
-                        logger.error(f"Failed to remove video from source playlist: {video_title}")
+                        logger.error(f"Failed to process video: {video_title}")
                         failed_count += 1
-                else:
-                    logger.error(f"Failed to add video to destination playlist: {video_title}")
+                        pbar.set_postfix({"✓": processed_count, "✗": failed_count})
+                        
+                except Exception as e:
+                    logger.error(f"Unexpected error processing video '{video_title}': {e}")
                     failed_count += 1
-            else:
-                logger.error(f"Failed to process video: {video_title}")
-                failed_count += 1
+                    pbar.set_postfix({"✓": processed_count, "✗": failed_count})
+                
+                pbar.update(1)
         
         # Summary
         logger.info(f"Processing complete. Processed: {processed_count}, Failed: {failed_count}")
-        print(f"\nProcessing Summary:")
-        print(f"Successfully processed and moved: {processed_count} videos")
+        print(f"\n{'='*50}")
+        print(f"PROCESSING SUMMARY")
+        print(f"{'='*50}")
+        print(f"Successfully processed: {processed_count} videos")
         print(f"Failed to process: {failed_count} videos")
+        print(f"Success rate: {processed_count/(processed_count+failed_count)*100:.1f}%" if (processed_count + failed_count) > 0 else "No videos processed")
+        print(f"Output directory: {CONFIG.file.output_directory}")
+        if args.dry_run:
+            print(f"NOTE: Dry run mode - videos were not moved between playlists")
         
+    except KeyboardInterrupt:
+        logger.info("Processing interrupted by user")
+        print("\nProcessing interrupted. Partial results may be available in output directory.")
     except Exception as e:
         logger.error(f"Fatal error in main: {e}")
+        print(f"\nFatal error: {e}")
         return
 
 if __name__ == "__main__":
