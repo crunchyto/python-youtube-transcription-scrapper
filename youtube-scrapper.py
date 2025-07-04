@@ -433,18 +433,34 @@ class YouTubeTranscriptionScrapper:
         """Analyze a single transcript chunk"""
         prompt = """Please analyze this YouTube video transcript and provide:
 
-1. A comprehensive summary of the main points (3-4 paragraphs) with key points as bullets
-2. Extract any references to books, articles, YouTube channels, podcasts, websites, tools, or other media mentioned in the video
+1. A comprehensive summary of the main points (2-3 paragraphs)
+2. Key takeaways as bullet points
+3. Extract any references to YouTube videos, podcasts, websites, URLs mentioned in the video
+4. Extract any references to books, articles, tools, software, or other media mentioned in the video
 
 Format your response as follows:
 SUMMARY:
-[Your summary here with bullet points for key insights]
+[Your comprehensive summary here]
 
-RESOURCES:
-1. Resource/Reference #1
-2. Resource/Reference #2
+KEY POINTS:
+• Key point #1
+• Key point #2
+• Key point #3
 ...
 
+REFERENCES:
+1. YouTube Video/Channel: [name/link]
+2. Podcast: [name/link]
+3. Website/URL: [name/link]
+...
+
+RESOURCES:
+1. Book: [title and author]
+2. Tool/Software: [name]
+3. Article: [title]
+...
+
+If no references are mentioned, write "No specific references mentioned."
 If no resources are mentioned, write "No specific resources mentioned."""
 
         response = self.client.chat.completions.create(
@@ -460,50 +476,64 @@ If no resources are mentioned, write "No specific resources mentioned."""
         analysis = response.choices[0].message.content
         logger.info("Analysis completed successfully")
         
-        # Parse the response to separate summary and resources
-        if "SUMMARY:" in analysis and "RESOURCES:" in analysis:
-            parts = analysis.split("RESOURCES:")
-            summary = parts[0].replace("SUMMARY:", "").strip()
-            resources = parts[1].strip()
-            return {"summary": summary, "resources": resources}
+        # Parse the response to separate summary, key points, references, and resources
+        sections = {"summary": "", "key_points": "", "references": "", "resources": ""}
+        
+        if "SUMMARY:" in analysis:
+            # Extract summary
+            if "KEY POINTS:" in analysis:
+                summary_part = analysis.split("KEY POINTS:")[0].replace("SUMMARY:", "").strip()
+            else:
+                summary_part = analysis.replace("SUMMARY:", "").strip()
+            sections["summary"] = summary_part
+            
+            # Extract key points
+            if "KEY POINTS:" in analysis and "REFERENCES:" in analysis:
+                key_points_part = analysis.split("KEY POINTS:")[1].split("REFERENCES:")[0].strip()
+                sections["key_points"] = key_points_part
+            elif "KEY POINTS:" in analysis:
+                key_points_part = analysis.split("KEY POINTS:")[1].strip()
+                sections["key_points"] = key_points_part
+            else:
+                sections["key_points"] = "No key points extracted."
+                
+            # Extract references
+            if "REFERENCES:" in analysis and "RESOURCES:" in analysis:
+                references_part = analysis.split("REFERENCES:")[1].split("RESOURCES:")[0].strip()
+                sections["references"] = references_part
+            elif "REFERENCES:" in analysis:
+                references_part = analysis.split("REFERENCES:")[1].strip()
+                sections["references"] = references_part
+            else:
+                sections["references"] = "No specific references mentioned."
+                
+            # Extract resources
+            if "RESOURCES:" in analysis:
+                resources_part = analysis.split("RESOURCES:")[1].strip()
+                sections["resources"] = resources_part
+            else:
+                sections["resources"] = "No specific resources mentioned."
+                
+            return sections
         else:
             # Fallback if format is not followed
-            return {"summary": analysis, "resources": "No specific resources mentioned."}
+            return {
+                "summary": analysis,
+                "key_points": "No key points extracted.",
+                "references": "No specific references mentioned.",
+                "resources": "No specific resources mentioned."
+            }
     
     def _analyze_chunked_transcript(self, chunks: List[str]) -> Dict[str, str]:
-        """Analyze multiple transcript chunks and combine results"""
-        summaries = []
-        all_resources = set()
+        """Analyze multiple transcript chunks and create unified analysis"""
+        # Combine all chunks into one full transcript for unified analysis
+        full_transcript = "\n\n".join(chunks)
         
-        for i, chunk in enumerate(chunks):
-            logger.info(f"Analyzing chunk {i+1}/{len(chunks)}")
-            chunk_analysis = self._analyze_single_transcript(chunk)
-            summaries.append(chunk_analysis['summary'])
-            
-            # Extract resources from this chunk
-            resources_text = chunk_analysis.get('resources', '')
-            if resources_text and resources_text != "No specific resources mentioned.":
-                # Parse resources and add to set
-                resource_lines = [line.strip() for line in resources_text.split('\n') if line.strip()]
-                for line in resource_lines:
-                    if line and not line.startswith(('1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.')):
-                        all_resources.add(line)
-                    elif line and any(line.startswith(f'{i}.') for i in range(1, 10)):
-                        all_resources.add(line[2:].strip())  # Remove numbering
+        # Create a unified analysis of the complete transcript
+        logger.info(f"Creating unified analysis from {len(chunks)} chunks")
+        unified_analysis = self._analyze_single_transcript(full_transcript)
         
-        # Combine summaries
-        combined_summary = "\n\n--- PART SUMMARY ---\n\n".join(summaries)
-        
-        # Format resources
-        if all_resources:
-            resources_formatted = "\n".join(f"{i+1}. {resource}" for i, resource in enumerate(sorted(all_resources)))
-        else:
-            resources_formatted = "No specific resources mentioned."
-        
-        return {
-            "summary": combined_summary,
-            "resources": resources_formatted
-        }
+        return unified_analysis
 
     def process_video(self, video_id: str, video_title: str) -> bool:
         """
@@ -548,19 +578,29 @@ If no resources are mentioned, write "No specific resources mentioned."""
                     f.write(f"Processing Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                     
                     f.write("="*50 + "\n")
+                    f.write("FULL TRANSCRIPTION\n")
+                    f.write("="*50 + "\n\n")
+                    f.write(transcript + "\n\n")
+                    
+                    f.write("="*50 + "\n")
                     f.write("SUMMARY\n")
                     f.write("="*50 + "\n\n")
                     f.write(analysis['summary'] + "\n\n")
                     
                     f.write("="*50 + "\n")
-                    f.write("RESOURCES CITED\n")
+                    f.write("KEY POINTS\n")
                     f.write("="*50 + "\n\n")
-                    f.write(analysis['resources'] + "\n\n")
+                    f.write(analysis['key_points'] + "\n\n")
                     
                     f.write("="*50 + "\n")
-                    f.write("FULL TRANSCRIPTION\n")
+                    f.write("REFERENCES\n")
                     f.write("="*50 + "\n\n")
-                    f.write(transcript + "\n")
+                    f.write(analysis['references'] + "\n\n")
+                    
+                    f.write("="*50 + "\n")
+                    f.write("RESOURCES CITED\n")
+                    f.write("="*50 + "\n\n")
+                    f.write(analysis['resources'] + "\n")
                 
                 logger.info(f"Successfully saved analysis to {output_path}")
                 return True
